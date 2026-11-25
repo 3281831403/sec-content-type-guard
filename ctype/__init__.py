@@ -1,0 +1,1 @@
+"""Content type guard package."""
