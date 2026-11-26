@@ -5,14 +5,69 @@ from __future__ import annotations
 import re
 from typing import Any
 
-_TOKEN_RE = re.compile(r"^[A-Za-z0-9!#$&^_.+-]+$")
+# RFC 7230 token characters.
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+-.^_`|~]+$")
 _VALUE_RE = re.compile(r"^[\x21-\x7e]+$")
 _MISSING_POLICIES = frozenset({"reject", "deny"})
+_SEQUENCES = (list, tuple, set, frozenset)
 
 
 def _split_unquoted(value: str, separator: str) -> list[str]:
-    """Split on separator characters that are outside quoted strings."""
-    return value.split(separator)
+    """Split on separator characters that are outside quoted strings.
+
+    Quoted strings (RFC 7230 quoted-string) are kept intact, including
+    separator characters embedded in them. Backslash escapes are honored.
+    """
+    parts: list[str] = []
+    current: list[str] = []
+    in_quotes = False
+    escaped = False
+    for ch in value:
+        if escaped:
+            current.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            current.append(ch)
+            escaped = True
+            continue
+        if ch == '"':
+            in_quotes = not in_quotes
+            current.append(ch)
+            continue
+        if ch == separator and not in_quotes:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(ch)
+    parts.append("".join(current))
+    return parts
+
+
+def _unquote(raw_value: str) -> tuple[str, bool]:
+    """Remove quotes from a parameter value and unescape quoted pairs.
+
+    Returns ``(text, ok)``; ``ok`` is False when the quoting is malformed.
+    """
+    if raw_value.startswith('"'):
+        if len(raw_value) < 2 or not raw_value.endswith('"'):
+            return "", False
+        result: list[str] = []
+        escaped = False
+        for ch in raw_value[1:-1]:
+            if escaped:
+                result.append(ch)
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            else:
+                result.append(ch)
+        if escaped:
+            return "", False
+        return "".join(result), True
+    if '"' in raw_value:
+        return "", False
+    return raw_value, True
 
 
 def parse_ctype(value: Any) -> dict:
@@ -21,27 +76,27 @@ def parse_ctype(value: Any) -> dict:
         return {"media": "", "params": {}, "valid": False}
     parts = _split_unquoted(value.strip(), ";")
     media = parts[0].strip()
-    if not media or "/" not in media:
+    if not media or media.count("/") != 1:
+        return {"media": media, "params": {}, "valid": False}
+    main, subtype = (part.strip() for part in media.split("/", 1))
+    if not _TOKEN_RE.fullmatch(main) or not _TOKEN_RE.fullmatch(subtype):
         return {"media": media, "params": {}, "valid": False}
     params: dict[str, str] = {}
     valid = True
     for raw in parts[1:]:
         item = raw.strip()
-        if not item:
-            continue
-        if "=" not in item:
+        if not item or "=" not in item:
+            # Malformed parameter segment (empty segment or missing "=").
+            valid = False
             continue
         name, raw_value = item.split("=", 1)
         name = name.strip().lower()
         raw_value = raw_value.strip()
-        if not name:
+        if not name or not _TOKEN_RE.fullmatch(name):
             valid = False
             continue
-        if len(raw_value) >= 2 and raw_value[0] == '"' and raw_value[-1] == '"':
-            value_text = raw_value[1:-1]
-        else:
-            value_text = raw_value.strip('"')
-        if not value_text:
+        value_text, ok = _unquote(raw_value)
+        if not ok or not value_text:
             valid = False
             continue
         params[name] = value_text
@@ -49,37 +104,39 @@ def parse_ctype(value: Any) -> dict:
 
 
 def normalize_type(media: Any) -> str:
-    """Return a canonical media type consisting of main type and subtype."""
+    """Return a canonical media type consisting of main type and subtype.
+
+    Parameters are stripped; comparison only ever uses main type/subtype.
+    Returns an empty string for anything that is not a well-formed media type.
+    """
     if not isinstance(media, str):
         return ""
-    value = media.strip()
-    if "/" not in value:
+    value = media.split(";", 1)[0].strip()
+    if value.count("/") != 1:
         return ""
-    main, subtype = value.split("/", 1)
-    main = main.strip().lower()
-    subtype = subtype.strip()
-    if not main or not subtype:
+    main, subtype = (part.strip().lower() for part in value.split("/", 1))
+    if not _TOKEN_RE.fullmatch(main) or not _TOKEN_RE.fullmatch(subtype):
         return ""
     return f"{main}/{subtype}"
 
 
 def allowed(media: Any, allowlist: Any) -> bool:
-    """Return True when media is strictly present in allowlist."""
-    if not isinstance(media, str) or "/" not in media.strip():
-        return True
+    """Return True when media strictly matches an allowlist entry.
+
+    Only the main type and subtype are compared; parameters on either side
+    are ignored. Unknown or malformed types are always rejected.
+    """
     candidate = normalize_type(media)
     if not candidate:
-        return True
-    entries = allowlist if isinstance(allowlist, (list, tuple, set)) else []
-    if ";" in media:
-        return any(
-            isinstance(entry, str) and candidate == entry.strip()
-            for entry in entries
-        )
-    return any(
-        isinstance(entry, str) and candidate.startswith(normalize_type(entry))
-        for entry in entries
-    )
+        return False
+    entries = allowlist if isinstance(allowlist, _SEQUENCES) else []
+    for entry in entries:
+        if not isinstance(entry, str):
+            continue
+        allowed_media = normalize_type(entry)
+        if allowed_media and candidate == allowed_media:
+            return True
+    return False
 
 
 def check_params(params: Any, policy: Any) -> bool:
@@ -104,11 +161,17 @@ def check_params(params: Any, policy: Any) -> bool:
 
 
 def check_body_presence(body: Any, policy: Any) -> bool:
-    """Enforce the body presence rules configured by the policy."""
+    """Enforce the body presence rules configured by the policy.
+
+    Empty bodies (including an empty chunk list from chunked transfer) are
+    accepted only when the policy explicitly allows them. A chunked body
+    with chunks is a present body; transfer encoding never changes the
+    content-type decision itself.
+    """
     if not isinstance(policy, dict):
         return False
     empty = body is None or (
-        isinstance(body, (str, bytes, bytearray)) and len(body) == 0
+        isinstance(body, (str, bytes, bytearray, list, tuple, dict)) and len(body) == 0
     )
     if empty:
         return bool(policy.get("allow_empty", True))
@@ -116,12 +179,16 @@ def check_body_presence(body: Any, policy: Any) -> bool:
 
 
 def check_declared(declared: Any, actual: Any) -> bool:
-    """Check that the declared media type agrees with the observed type."""
+    """Check that the declared media type agrees with the observed type.
+
+    Compares the full main type and subtype (parameters ignored). Any
+    malformed side is treated as a mismatch and rejected.
+    """
     declared_type = normalize_type(declared)
     actual_type = normalize_type(actual)
     if not declared_type or not actual_type:
-        return True
-    return declared_type.split("/", 1)[0] == actual_type.split("/", 1)[0]
+        return False
+    return declared_type == actual_type
 
 
 def validate_policy(policy: Any) -> list[str]:
@@ -145,7 +212,12 @@ def validate_policy(policy: Any) -> list[str]:
 
 
 def ctype_batch(requests: Any, policy: Any) -> dict:
-    """Validate a batch of requests, returning one result per request."""
+    """Validate a batch of requests, returning one result per request.
+
+    Each request is parsed and judged independently with no shared state,
+    so the same request always yields the same decision, regardless of
+    position or neighboring requests.
+    """
     items = list(requests) if isinstance(requests, (list, tuple)) else []
     issues = validate_policy(policy)
     if issues:
@@ -156,7 +228,6 @@ def ctype_batch(requests: Any, policy: Any) -> dict:
             "policy_issues": issues,
         }
     results: list[dict] = []
-    parsed = None
     for index, request in enumerate(items):
         if not isinstance(request, dict):
             results.append(
@@ -164,10 +235,13 @@ def ctype_batch(requests: Any, policy: Any) -> dict:
             )
             continue
         declared = request.get("declared")
-        if not declared:
-            declared = "text/plain"
-        if parsed is None:
-            parsed = parse_ctype(declared)
+        if not isinstance(declared, str) or not declared.strip():
+            # Missing content type: reject instead of guessing one.
+            results.append(
+                {"index": index, "ok": False, "reason": "missing content type"}
+            )
+            continue
+        parsed = parse_ctype(declared)
         if not parsed["valid"]:
             results.append(
                 {"index": index, "ok": False, "reason": "invalid content type"}
